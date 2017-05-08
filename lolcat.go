@@ -3,7 +3,11 @@ package main
 import (
 	"bufio"
 	"container/ring"
+	"fmt"
+	"os"
 	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/mattn/go-runewidth"
 	"github.com/nsf/termbox-go"
@@ -12,30 +16,59 @@ import (
 // BufferLineCount is the number of lines of buffer to keep in memory from logcat.
 const BufferLineCount = 1000
 
+// devices is the list of devices that we currently know about.
+var devices []*Device
+
+// deviceIndex the index into devices that we're currently displaying.
+var deviceIndex int
+
 // Device is all the stuff we know about a single attached device.
 type Device struct {
+	// ID is the identfiied of the device, that you'd pass to adb's "-s" parameter
+	ID string
+
+	// Name is the display name of the device, that we show in the UI.
+	Name string
+
 	logcat *ring.Ring
+
+	waiting bool
+	ping    chan int
 }
 
 func (d *Device) appendLine(line string) {
 	d.logcat = d.logcat.Prev()
 	d.logcat.Value = line
-	// TODO: notify listeners
+
+	if d.waiting {
+		d.ping <- 1
+	}
 }
 
 // Open opens a connection to the given device via an adb command. Basically we start streaming
 // logcat output to the device's AbdContext.
 func (d *Device) Open() {
 	d.logcat = ring.New(BufferLineCount)
+	d.ping = make(chan int)
+	d.waiting = false
 
-	cmd := exec.Command("adb", "logcat")
+	cmd := exec.Command("adb", "-s", d.ID, "logcat", "-v", "threadtime")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		panic("An error occurred reading output: " + err.Error())
 	}
 	scanner := bufio.NewScanner(stdout)
 	go func() {
+		lastTime := time.Now()
 		for scanner.Scan() {
+			if !d.waiting {
+				thisTime := time.Now()
+				if thisTime.UnixNano()-lastTime.UnixNano() > 1000000000 {
+					// More than a second passed, we can start notifying listeners of new updates
+					d.waiting = true
+				}
+				lastTime = thisTime
+			}
 			d.appendLine(scanner.Text())
 		}
 		if err := scanner.Err(); err != nil {
@@ -47,8 +80,6 @@ func (d *Device) Open() {
 		panic("Error starting adb logcat: " + err.Error())
 	}
 }
-
-var d *Device
 
 func tbprint(x, y int, fg, bg termbox.Attribute, msg string) int {
 	n := 0
@@ -69,25 +100,28 @@ func render() {
 	// Top line, device list
 	x := 0
 	coldef = termbox.ColorDefault | termbox.AttrReverse
-	// TODO: for devices:
-	x += tbprint(x, 0, coldef, coldef, "［")
-	coldef = termbox.ColorDefault
-	x += tbprint(x, 0, coldef, coldef, "Device Here")
-	coldef = termbox.ColorDefault | termbox.AttrReverse
-	x += tbprint(x, 0, coldef, coldef, "］")
+	for _, d := range devices {
+		x += tbprint(x, 0, coldef, coldef, "［")
+		coldef = termbox.ColorDefault
+		x += tbprint(x, 0, coldef, coldef, d.Name)
+		coldef = termbox.ColorDefault | termbox.AttrReverse
+		x += tbprint(x, 0, coldef, coldef, "］")
+	}
 	for ; x < w; x++ {
 		termbox.SetCell(x, 0, ' ', coldef, coldef)
 	}
 
 	// Start from bottom and write up
-	logcat := d.logcat
-	coldef = termbox.ColorDefault
-	for y := h - 3; y >= 1; y-- {
-		if logcat.Value == nil {
-			break
+	if len(devices) > deviceIndex {
+		logcat := devices[deviceIndex].logcat
+		coldef = termbox.ColorDefault
+		for y := h - 3; y >= 1; y-- {
+			if logcat.Value == nil {
+				break
+			}
+			tbprint(0, y, coldef, coldef, logcat.Value.(string))
+			logcat = logcat.Next()
 		}
-		tbprint(0, y, coldef, coldef, logcat.Value.(string))
-		logcat = logcat.Next()
 	}
 
 	// Second from bottom line, filter.
@@ -110,21 +144,50 @@ func render() {
 		termbox.SetCell(x, y, ' ', coldef, coldef)
 	}
 
-	// unicode box drawing chars around the edit box
-	//	termbox.SetCell(midx-1, midy, '│', coldef, coldef)
-	//	termbox.SetCell(midx+edit_box_width, midy, '│', coldef, coldef)
-	//	termbox.SetCell(midx-1, midy-1, '┌', coldef, coldef)
-	//	termbox.SetCell(midx-1, midy+1, '└', coldef, coldef)
-	//	termbox.SetCell(midx+edit_box_width, midy-1, '┐', coldef, coldef)
-	//	termbox.SetCell(midx+edit_box_width, midy+1, '┘', coldef, coldef)
-	//	fill(midx, midy-1, edit_box_width, 1, termbox.Cell{Ch: '─'})
-	//	fill(midx, midy+1, edit_box_width, 1, termbox.Cell{Ch: '─'})
-
-	//	edit_box.Draw(midx, midy, edit_box_width, 1)
-	//	termbox.SetCursor(midx+edit_box.CursorX(), midy)
-
-	//	tbprint(midx+6, midy+3, coldef, coldef, "Press ESC to quit")
 	termbox.Flush()
+}
+
+// refreshDevices refreshes the list of attached devices (by running 'adb devices' basically).
+func refreshDevices() {
+	cmd := exec.Command("adb", "devices", "-l")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		panic("'adb devices' error: " + err.Error())
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	err = cmd.Start()
+	if err != nil {
+		panic("'adb devices' error: " + err.Error())
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Fields(line)
+		if len(parts) < 2 || parts[1] != "device" {
+			fmt.Fprintf(os.Stderr, "Not a device line: '%s'", line)
+			continue
+		}
+
+		id := parts[0]
+		name := id
+		for i := 2; i < len(parts); i++ {
+			kvp := strings.Split(parts[i], ":")
+			if len(kvp) == 2 && kvp[0] == "model" {
+				name = kvp[1]
+			}
+		}
+
+		d := &Device{
+			ID:   id,
+			Name: strings.Replace(name, "_", " ", -1),
+		}
+		d.Open()
+		devices = append(devices, d)
+	}
+	if err := scanner.Err(); err != nil {
+		panic("An error occurred reading output: " + err.Error())
+	}
 }
 
 func main() {
@@ -135,43 +198,27 @@ func main() {
 	defer termbox.Close()
 	termbox.SetInputMode(termbox.InputEsc)
 
-	d = &Device{}
-	d.Open()
-
+	refreshDevices()
 	render()
+
+	events := make(chan termbox.Event)
+	go func() {
+		for {
+			events <- termbox.PollEvent()
+		}
+	}()
+
 mainloop:
 	for {
-		switch ev := termbox.PollEvent(); ev.Type {
-		case termbox.EventKey:
-			switch ev.Key {
-			case termbox.KeyEsc:
+		select {
+		case ev := <-events:
+			if ev.Key == termbox.KeyEsc {
 				break mainloop
-				//			case termbox.KeyArrowLeft, termbox.KeyCtrlB:
-				//				edit_box.MoveCursorOneRuneBackward()
-				//			case termbox.KeyArrowRight, termbox.KeyCtrlF:
-				//				edit_box.MoveCursorOneRuneForward()
-				//			case termbox.KeyBackspace, termbox.KeyBackspace2:
-				//				edit_box.DeleteRuneBackward()
-				//			case termbox.KeyDelete, termbox.KeyCtrlD:
-				//				edit_box.DeleteRuneForward()
-				//			case termbox.KeyTab:
-				//				edit_box.InsertRune('\t')
-				//			case termbox.KeySpace:
-				//				edit_box.InsertRune(' ')
-				//			case termbox.KeyCtrlK:
-				//				edit_box.DeleteTheRestOfTheLine()
-				//			case termbox.KeyHome, termbox.KeyCtrlA:
-				//				edit_box.MoveCursorToBeginningOfTheLine()
-				//			case termbox.KeyEnd, termbox.KeyCtrlE:
-				//				edit_box.MoveCursorToEndOfTheLine()
-				//			default:
-				//				if ev.Ch != 0 {
-				//					edit_box.InsertRune(ev.Ch)
-				//				}
 			}
-		case termbox.EventError:
-			panic(ev.Err)
+			render()
+
+		case <-devices[deviceIndex].ping:
+			render()
 		}
-		render()
 	}
 }
