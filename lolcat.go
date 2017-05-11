@@ -2,11 +2,11 @@ package main
 
 import (
 	"bufio"
-	"container/ring"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mattn/go-runewidth"
@@ -22,6 +22,27 @@ var devices []*Device
 // deviceIndex the index into devices that we're currently displaying.
 var deviceIndex int
 
+// LogBuffer represents a fixed-size buffer of log lines. The lines are indexed with 0 being the
+// oldest line and N being the most recent log line. Older logs will be expired, but the index
+// will never be reused (this means a LogView can reference expired lines without having to
+// update the views every time a line is expired).
+type LogBuffer struct {
+	lines []string
+
+	// nextLineIndex is the index into the lines[] slice that the *next* log line will go.
+	nextLineIndex int
+
+	// lineNo is the line number (starting from 1) that the *most recent* log line has. This number
+	// increments for every line that's added to the buffer, whereas nextLineIndex wraps around as
+	// the buffer fills up.
+	lineNo int64
+}
+
+// LogView is a "view" over a device's logs. There's a special view that represents all logs, and
+// then there is zero or more LogView's for filtered results.
+type LogView struct {
+}
+
 // Device is all the stuff we know about a single attached device.
 type Device struct {
 	// ID is the identfiied of the device, that you'd pass to adb's "-s" parameter
@@ -30,28 +51,49 @@ type Device struct {
 	// Name is the display name of the device, that we show in the UI.
 	Name string
 
-	logcat *ring.Ring
+	logBuffer *LogBuffer
+
+	// mutex is used to synchronize access to the log buffer.
+	mutex *sync.Mutex
 
 	waiting bool
 	ping    chan int
 }
 
 func (d *Device) appendLine(line string) {
-	d.logcat = d.logcat.Prev()
-	d.logcat.Value = line
+	d.mutex.Lock()
+	d.logBuffer.lines[d.logBuffer.nextLineIndex] = line
+	d.logBuffer.lineNo++
+	d.logBuffer.nextLineIndex++
+	if d.logBuffer.nextLineIndex >= len(d.logBuffer.lines) {
+		d.logBuffer.nextLineIndex = 0
+	}
+	d.mutex.Unlock()
 
 	if d.waiting {
 		d.ping <- 1
 	}
 }
 
+// NewDevice creates a new instance of Device for the device with the given ID and name.
+func NewDevice(id, name string) *Device {
+	return &Device{
+		ID:   id,
+		Name: name,
+		logBuffer: &LogBuffer{
+			lines:         make([]string, BufferLineCount),
+			nextLineIndex: 0,
+			lineNo:        0,
+		},
+		mutex:   &sync.Mutex{},
+		ping:    make(chan int),
+		waiting: false,
+	}
+}
+
 // Open opens a connection to the given device via an adb command. Basically we start streaming
 // logcat output to the device's AbdContext.
 func (d *Device) Open() {
-	d.logcat = ring.New(BufferLineCount)
-	d.ping = make(chan int)
-	d.waiting = false
-
 	cmd := exec.Command("adb", "-s", d.ID, "logcat", "-v", "threadtime")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -63,8 +105,8 @@ func (d *Device) Open() {
 		for scanner.Scan() {
 			if !d.waiting {
 				thisTime := time.Now()
-				if thisTime.UnixNano()-lastTime.UnixNano() > 1000000000 {
-					// More than a second passed, we can start notifying listeners of new updates
+				if thisTime.UnixNano()-lastTime.UnixNano() > 500000000 {
+					// More than 1/2 second passed, we can start notifying listeners of new updates
 					d.waiting = true
 				}
 				lastTime = thisTime
@@ -79,6 +121,39 @@ func (d *Device) Open() {
 	if err != nil {
 		panic("Error starting adb logcat: " + err.Error())
 	}
+}
+
+// GetLastLineNo returns the index of the last line in the log buffer.
+// You should only call this method when you've got the device's mutex locked.
+func (lb *LogBuffer) GetLastLineNo() int64 {
+	return lb.lineNo
+}
+
+// GetLines returns a slice of the lines from the given line number to the given line number.
+// You should only call this method when you've got the device's mutex locked.
+func (lb *LogBuffer) GetLines(from, to int64) []string {
+	if from < 0 {
+		from = 0
+	}
+	if from == to {
+		return make([]string, 0)
+	}
+
+	// TODO: can we keep these in a buffer to avoid allocating the new array each time?
+	res := make([]string, int(to-from))
+	i := 0
+	for lineNo := to; lineNo > from; lineNo-- {
+		index := lb.nextLineIndex - int(lb.lineNo-lineNo) - 1
+		if index < 0 {
+			index += len(lb.lines)
+		}
+		if index < 0 {
+			break
+		}
+		res[i] = lb.lines[index]
+		i++
+	}
+	return res
 }
 
 func tbprint(x, y int, fg, bg termbox.Attribute, msg string) int {
@@ -113,14 +188,17 @@ func render() {
 
 	// Start from bottom and write up
 	if len(devices) > deviceIndex {
-		logcat := devices[deviceIndex].logcat
+		logBuffer := devices[deviceIndex].logBuffer
+		devices[deviceIndex].mutex.Lock()
+		lastLineNo := logBuffer.GetLastLineNo()
+		firstLineNo := lastLineNo - int64(h) - 3
+		lines := logBuffer.GetLines(firstLineNo, lastLineNo)
+		devices[deviceIndex].mutex.Unlock()
+
 		coldef = termbox.ColorDefault
-		for y := h - 3; y >= 1; y-- {
-			if logcat.Value == nil {
-				break
-			}
-			tbprint(0, y, coldef, coldef, logcat.Value.(string))
-			logcat = logcat.Next()
+		for i := 0; i < len(lines); i++ {
+			y := h - 2 - i
+			tbprint(0, y, coldef, coldef, lines[i])
 		}
 	}
 
@@ -165,7 +243,7 @@ func refreshDevices() {
 		line := scanner.Text()
 		parts := strings.Fields(line)
 		if len(parts) < 2 || parts[1] != "device" {
-			fmt.Fprintf(os.Stderr, "Not a device line: '%s'", line)
+			fmt.Fprintf(os.Stderr, "Not a device line: '%s'\n", line)
 			continue
 		}
 
@@ -178,10 +256,7 @@ func refreshDevices() {
 			}
 		}
 
-		d := &Device{
-			ID:   id,
-			Name: strings.Replace(name, "_", " ", -1),
-		}
+		d := NewDevice(id, strings.Replace(name, "_", " ", -1))
 		d.Open()
 		devices = append(devices, d)
 	}
