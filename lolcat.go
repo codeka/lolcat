@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +63,10 @@ type LogBuffer struct {
 // then there is zero or more LogView's for filtered results.
 type LogView struct {
 	Name string
+
+	lb     *LogBuffer
+	filter *regexp.Regexp
+	index  []int64
 }
 
 // Device is all the stuff we know about a single attached device.
@@ -145,6 +150,18 @@ func (d *Device) Open() {
 	}
 }
 
+// LineNoToIndex converts the given line number to an index into the lines buffer.
+func (lb *LogBuffer) LineNoToIndex(lineNo int64) int {
+	index := lb.nextLineIndex - int(lb.lineNo-lineNo) - 1
+	if index < 0 {
+		index += len(lb.lines)
+	}
+	if index < 0 || index >= len(lb.lines) {
+		return -1
+	}
+	return index
+}
+
 // GetLastLineNo returns the index of the last line in the log buffer.
 // You should only call this method when you've got the device's mutex locked.
 func (lb *LogBuffer) GetLastLineNo() int64 {
@@ -165,15 +182,76 @@ func (lb *LogBuffer) GetLines(from, to int64) []string {
 	res := make([]string, int(to-from))
 	i := 0
 	for lineNo := to; lineNo > from; lineNo-- {
-		index := lb.nextLineIndex - int(lb.lineNo-lineNo) - 1
-		if index < 0 {
-			index += len(lb.lines)
-		}
+		index := lb.LineNoToIndex(lineNo)
 		if index < 0 {
 			break
 		}
 		res[i] = lb.lines[index]
 		i++
+	}
+	return res
+}
+
+// UpdateFilter refreshes the filter for the current LogView to be the given regex.
+func (lv *LogView) UpdateFilter(lb *LogBuffer, str string) {
+	runes := []rune(str)
+	if len(runes) == 0 {
+		lv.Name = "<empty>"
+	} else if len(runes) > 16 {
+		runes = runes[:16]
+		lv.Name = string(runes[:16]) + "..."
+	} else {
+		lv.Name = str
+	}
+
+	filter, err := regexp.Compile(str)
+	if err != nil {
+		lv.filter = nil
+		lv.Name = "#ERR#"
+	} else {
+		lv.filter = filter
+	}
+
+	lv.index = nil
+	for no := lb.lineNo - int64(len(lb.lines)); no <= lb.lineNo; no++ {
+		if no <= 0 {
+			continue
+		}
+		index := lb.LineNoToIndex(no)
+		if lv.filter == nil || lv.filter.MatchString(lb.lines[index]) {
+			lv.index = append(lv.index, no)
+		}
+	}
+}
+
+// GetLastLineNo returns the index of the last line in the log buffer.
+// You should only call this method when you've got the device's mutex locked.
+func (lv *LogView) GetLastLineNo() int64 {
+	if lv.index == nil {
+		return 0
+	}
+
+	return lv.index[len(lv.index)-1]
+}
+
+// GetLines returns a slice of the lines with the given line no at the end, and count elements big.
+func (lv *LogView) GetLines(bottomLineNo int64, count int) []string {
+	// TODO: can we keep these in a buffer to avoid allocating the new array each time?
+	res := make([]string, int(count))
+	ri := count - 1
+	for i := len(lv.index) - 1; i >= 0; i-- {
+		if lv.index[i] > bottomLineNo {
+			continue
+		}
+		index := lv.lb.LineNoToIndex(lv.index[i])
+		if index < 0 {
+			break
+		}
+		res[ri] = lv.lb.lines[index]
+		ri--
+		if ri < 0 {
+			break
+		}
 	}
 	return res
 }
@@ -413,9 +491,16 @@ func render() {
 	if len(devices) > deviceIndex {
 		logBuffer := devices[deviceIndex].logBuffer
 		devices[deviceIndex].mutex.Lock()
-		lastLineNo := logBuffer.GetLastLineNo()
-		firstLineNo := lastLineNo - int64(h) - 12
-		lines := logBuffer.GetLines(firstLineNo, lastLineNo)
+		var lines []string
+		if viewIndex == 0 {
+			lastLineNo := logBuffer.GetLastLineNo()
+			firstLineNo := lastLineNo - int64(h) + 3
+			lines = logBuffer.GetLines(firstLineNo, lastLineNo)
+		} else {
+			lastLineNo := logBuffer.GetLastLineNo()
+			count := h - 3
+			lines = devices[deviceIndex].logViews[viewIndex-1].GetLines(lastLineNo, count)
+		}
 		devices[deviceIndex].mutex.Unlock()
 
 		coldef = termbox.ColorDefault
@@ -435,25 +520,24 @@ func render() {
 	x = 0
 	y = h - 1
 	coldef = termbox.ColorDefault
-	x += tbprint(x, y, coldef, coldef, "［")
+	x += tbprint(x, y, coldef, coldef, " ")
 	if viewIndex == 0 {
 		coldef = termbox.ColorDefault | termbox.AttrReverse
 	}
 	x += tbprint(x, y, coldef, coldef, "no filter")
 	coldef = termbox.ColorDefault
-	x += tbprint(x, y, coldef, coldef, "］")
+	x += tbprint(x, y, coldef, coldef, "  ")
 
 	for n, view := range devices[deviceIndex].logViews {
-		x += tbprint(x, y, coldef, coldef, "［")
 		if viewIndex-1 == n {
 			coldef = termbox.ColorDefault | termbox.AttrReverse
 		}
 		x += tbprint(x, y, coldef, coldef, view.Name)
 		coldef = termbox.ColorDefault
-		x += tbprint(x, y, coldef, coldef, "］")
+		x += tbprint(x, y, coldef, coldef, "  ")
 	}
 
-	x += tbprint(x, y, coldef, coldef, "［+filter］")
+	x += tbprint(x, y, coldef, coldef, "+filter")
 	for ; x < w; x++ {
 		termbox.SetCell(x, y, ' ', coldef, coldef)
 	}
@@ -469,9 +553,21 @@ func moveViewRight() {
 	if (viewIndex - 1) == len(device.logViews) {
 		device.logViews = append(device.logViews, &LogView{
 			Name: "<empty>",
+			lb:   device.logBuffer,
 		})
 	}
+	editbox.MoveCursorToBeginningOfTheLine()
+	editbox.DeleteTheRestOfTheLine()
 	render()
+}
+
+func updateCurrentView() {
+	device := devices[deviceIndex]
+	if viewIndex > 0 {
+		device.mutex.Lock()
+		device.logViews[viewIndex-1].UpdateFilter(device.logBuffer, string(editbox.text))
+		device.mutex.Unlock()
+	}
 }
 
 // refreshDevices refreshes the list of attached devices (by running 'adb devices' basically).
@@ -566,6 +662,7 @@ mainloop:
 					editbox.InsertRune(ev.Ch)
 				}
 			}
+			updateCurrentView()
 			render()
 		case <-devices[deviceIndex].ping:
 			render()
