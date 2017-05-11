@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mattn/go-runewidth"
 	"github.com/nsf/termbox-go"
@@ -16,11 +17,30 @@ import (
 // BufferLineCount is the number of lines of buffer to keep in memory from logcat.
 const BufferLineCount = 1000
 
+// PreferredHorizontalThreshold ??
+const PreferredHorizontalThreshold = 5
+
 // devices is the list of devices that we currently know about.
 var devices []*Device
 
 // deviceIndex the index into devices that we're currently displaying.
 var deviceIndex int
+
+// viewIndex the current LogView that we're looking at (0 == the full LogBuffer, 1 == the first one
+// etc)
+var viewIndex int
+
+// The EditBox we're writing into
+var editbox EditBox
+
+// EditBox represents the box where you're currently typing text.
+type EditBox struct {
+	text              []byte
+	visualOffset      int
+	cursorOffsetBytes int
+	cursorOffsetCells int
+	cursorOffsetRunes int
+}
 
 // LogBuffer represents a fixed-size buffer of log lines. The lines are indexed with 0 being the
 // oldest line and N being the most recent log line. Older logs will be expired, but the index
@@ -41,6 +61,7 @@ type LogBuffer struct {
 // LogView is a "view" over a device's logs. There's a special view that represents all logs, and
 // then there is zero or more LogView's for filtered results.
 type LogView struct {
+	Name string
 }
 
 // Device is all the stuff we know about a single attached device.
@@ -52,6 +73,7 @@ type Device struct {
 	Name string
 
 	logBuffer *LogBuffer
+	logViews  []*LogView
 
 	// mutex is used to synchronize access to the log buffer.
 	mutex *sync.Mutex
@@ -156,6 +178,199 @@ func (lb *LogBuffer) GetLines(from, to int64) []string {
 	return res
 }
 
+// Draw draws the EditBox in the given location
+func (eb *EditBox) Draw(x, y, w int) {
+	eb.AdjustVisualOffset(w)
+
+	const coldef = termbox.ColorDefault
+	fill(x, y, w, 1, termbox.Cell{Ch: ' '})
+
+	t := eb.text
+	lx := 0
+	tabstop := 0
+	for {
+		rx := lx - eb.visualOffset
+		if len(t) == 0 {
+			break
+		}
+
+		if rx >= w {
+			termbox.SetCell(x+w-1, y, '→',
+				coldef, coldef)
+			break
+		}
+
+		r, size := utf8.DecodeRune(t)
+		if r == '\t' {
+			for ; lx < tabstop; lx++ {
+				rx = lx - eb.visualOffset
+				if rx >= w {
+					goto next
+				}
+
+				if rx >= 0 {
+					termbox.SetCell(x+rx, y, ' ', coldef, coldef)
+				}
+			}
+		} else {
+			if rx >= 0 {
+				termbox.SetCell(x+rx, y, r, coldef, coldef)
+			}
+			lx += runewidth.RuneWidth(r)
+		}
+	next:
+		t = t[size:]
+	}
+
+	if eb.visualOffset != 0 {
+		termbox.SetCell(x, y, '←', coldef, coldef)
+	}
+}
+
+// AdjustVisualOffset adjusts line visual offset to a proper value depending on width
+func (eb *EditBox) AdjustVisualOffset(width int) {
+	ht := PreferredHorizontalThreshold
+	maxHorizontalThreshold := (width - 1) / 2
+	if ht > maxHorizontalThreshold {
+		ht = maxHorizontalThreshold
+	}
+
+	threshold := width - 1
+	if eb.visualOffset != 0 {
+		threshold = width - ht
+	}
+	if eb.cursorOffsetCells-eb.visualOffset >= threshold {
+		eb.visualOffset = eb.cursorOffsetCells + (ht - width + 1)
+	}
+
+	if eb.visualOffset != 0 && eb.cursorOffsetCells-eb.visualOffset < ht {
+		eb.visualOffset = eb.cursorOffsetCells - ht
+		if eb.visualOffset < 0 {
+			eb.visualOffset = 0
+		}
+	}
+}
+
+func adjustOffset(text []byte, offsetBytes int) (offsetCells, offsetRunes int) {
+	text = text[:offsetBytes]
+	for len(text) > 0 {
+		r, size := utf8.DecodeRune(text)
+		text = text[size:]
+		offsetRunes++
+		offsetCells += runewidth.RuneWidth(r)
+	}
+	return
+}
+
+// MoveCursorTo moves the cursor to the given byte offset.
+func (eb *EditBox) MoveCursorTo(offsetBytes int) {
+	eb.cursorOffsetBytes = offsetBytes
+	eb.cursorOffsetCells, eb.cursorOffsetCells = adjustOffset(eb.text, offsetBytes)
+}
+
+// RuneUnderCursor returns the rune (and it's size) under the cursor.
+func (eb *EditBox) RuneUnderCursor() (rune, int) {
+	return utf8.DecodeRune(eb.text[eb.cursorOffsetBytes:])
+}
+
+// RuneBeforeCursor returns the rune (and it's size) before the cursor.
+func (eb *EditBox) RuneBeforeCursor() (rune, int) {
+	return utf8.DecodeLastRune(eb.text[:eb.cursorOffsetBytes])
+}
+
+// MoveCursorOneRuneBackward moves the cursor one rune to the left (if possible)
+func (eb *EditBox) MoveCursorOneRuneBackward() {
+	if eb.cursorOffsetBytes == 0 {
+		return
+	}
+	_, size := eb.RuneBeforeCursor()
+	eb.MoveCursorTo(eb.cursorOffsetBytes - size)
+}
+
+// MoveCursorOneRuneForward moves the cursor one run to the right (if possible)
+func (eb *EditBox) MoveCursorOneRuneForward() {
+	if eb.cursorOffsetBytes == len(eb.text) {
+		return
+	}
+	_, size := eb.RuneUnderCursor()
+	eb.MoveCursorTo(eb.cursorOffsetBytes + size)
+}
+
+// MoveCursorToBeginningOfTheLine moves the cursor to the beginning of the line.
+func (eb *EditBox) MoveCursorToBeginningOfTheLine() {
+	eb.MoveCursorTo(0)
+}
+
+// MoveCursorToEndOfTheLine moves the cursor to the end of the line.
+func (eb *EditBox) MoveCursorToEndOfTheLine() {
+	eb.MoveCursorTo(len(eb.text))
+}
+
+// DeleteRuneBackward delets the rune to the left of the cursor.
+func (eb *EditBox) DeleteRuneBackward() {
+	if eb.cursorOffsetBytes == 0 {
+		return
+	}
+
+	eb.MoveCursorOneRuneBackward()
+	_, size := eb.RuneUnderCursor()
+	eb.text = byteSliceRemove(eb.text, eb.cursorOffsetBytes, eb.cursorOffsetBytes+size)
+}
+
+// DeleteRuneForward deletes the rune to the right of the cursor.
+func (eb *EditBox) DeleteRuneForward() {
+	if eb.cursorOffsetBytes == len(eb.text) {
+		return
+	}
+	_, size := eb.RuneUnderCursor()
+	eb.text = byteSliceRemove(eb.text, eb.cursorOffsetBytes, eb.cursorOffsetBytes+size)
+}
+
+// DeleteTheRestOfTheLine deletes everything to the right of the cursor.
+func (eb *EditBox) DeleteTheRestOfTheLine() {
+	eb.text = eb.text[:eb.cursorOffsetBytes]
+}
+
+// InsertRune inserts the given rune at the current cursor position.
+func (eb *EditBox) InsertRune(r rune) {
+	var buf [utf8.UTFMax]byte
+	n := utf8.EncodeRune(buf[:], r)
+	eb.text = byteSliceInsert(eb.text, eb.cursorOffsetBytes, buf[:n])
+	eb.MoveCursorOneRuneForward()
+}
+
+// CursorX ...
+// Please, keep in mind that cursor depends on the value of visualOffset, which
+// is being set on Draw() call, so.. call this method after Draw() one.
+func (eb *EditBox) CursorX() int {
+	return eb.cursorOffsetCells - eb.visualOffset
+}
+
+func byteSliceRemove(text []byte, from, to int) []byte {
+	size := to - from
+	copy(text[from:], text[to:])
+	text = text[:len(text)-size]
+	return text
+}
+
+func byteSliceGrow(s []byte, desiredCap int) []byte {
+	if cap(s) < desiredCap {
+		ns := make([]byte, len(s), desiredCap)
+		copy(ns, s)
+		return ns
+	}
+	return s
+}
+
+func byteSliceInsert(text []byte, offset int, what []byte) []byte {
+	n := len(text) + len(what)
+	text = byteSliceGrow(text, n)
+	text = text[:n]
+	copy(text[offset+len(what):], text[offset:])
+	copy(text[offset:], what)
+	return text
+}
+
 func tbprint(x, y int, fg, bg termbox.Attribute, msg string) int {
 	n := 0
 	for _, c := range msg {
@@ -165,6 +380,14 @@ func tbprint(x, y int, fg, bg termbox.Attribute, msg string) int {
 		n += width
 	}
 	return n
+}
+
+func fill(x, y, w, h int, cell termbox.Cell) {
+	for ly := 0; ly < h; ly++ {
+		for lx := 0; lx < w; lx++ {
+			termbox.SetCell(x+lx, y+ly, cell.Ch, cell.Fg, cell.Bg)
+		}
+	}
 }
 
 func render() {
@@ -191,13 +414,13 @@ func render() {
 		logBuffer := devices[deviceIndex].logBuffer
 		devices[deviceIndex].mutex.Lock()
 		lastLineNo := logBuffer.GetLastLineNo()
-		firstLineNo := lastLineNo - int64(h) - 3
+		firstLineNo := lastLineNo - int64(h) - 12
 		lines := logBuffer.GetLines(firstLineNo, lastLineNo)
 		devices[deviceIndex].mutex.Unlock()
 
 		coldef = termbox.ColorDefault
 		for i := 0; i < len(lines); i++ {
-			y := h - 2 - i
+			y := h - 3 - i
 			tbprint(0, y, coldef, coldef, lines[i])
 		}
 	}
@@ -205,24 +428,50 @@ func render() {
 	// Second from bottom line, filter.
 	// TODO: the first tab ("no filter") should have no filter line
 	y := h - 2
-	termbox.SetCursor(1, y)
+	editbox.Draw(1, y, w-2)
+	termbox.SetCursor(1+editbox.cursorOffsetCells, y)
 
 	// Last line, tabs, one tab per configured filter
 	x = 0
 	y = h - 1
-	// TODO: for tabs:
 	coldef = termbox.ColorDefault
 	x += tbprint(x, y, coldef, coldef, "［")
-	coldef = termbox.ColorDefault | termbox.AttrReverse
+	if viewIndex == 0 {
+		coldef = termbox.ColorDefault | termbox.AttrReverse
+	}
 	x += tbprint(x, y, coldef, coldef, "no filter")
 	coldef = termbox.ColorDefault
 	x += tbprint(x, y, coldef, coldef, "］")
+
+	for n, view := range devices[deviceIndex].logViews {
+		x += tbprint(x, y, coldef, coldef, "［")
+		if viewIndex-1 == n {
+			coldef = termbox.ColorDefault | termbox.AttrReverse
+		}
+		x += tbprint(x, y, coldef, coldef, view.Name)
+		coldef = termbox.ColorDefault
+		x += tbprint(x, y, coldef, coldef, "］")
+	}
+
 	x += tbprint(x, y, coldef, coldef, "［+filter］")
 	for ; x < w; x++ {
 		termbox.SetCell(x, y, ' ', coldef, coldef)
 	}
 
 	termbox.Flush()
+}
+
+// moveViewRight moves the selected view one to the right. If there's no more views, we'll create
+// a new one with an empty filter.
+func moveViewRight() {
+	device := devices[deviceIndex]
+	viewIndex++
+	if (viewIndex - 1) == len(device.logViews) {
+		device.logViews = append(device.logViews, &LogView{
+			Name: "<empty>",
+		})
+	}
+	render()
 }
 
 // refreshDevices refreshes the list of attached devices (by running 'adb devices' basically).
@@ -259,6 +508,9 @@ func refreshDevices() {
 		d := NewDevice(id, strings.Replace(name, "_", " ", -1))
 		d.Open()
 		devices = append(devices, d)
+
+		deviceIndex = 0
+		viewIndex = 0
 	}
 	if err := scanner.Err(); err != nil {
 		panic("An error occurred reading output: " + err.Error())
@@ -287,11 +539,34 @@ mainloop:
 	for {
 		select {
 		case ev := <-events:
-			if ev.Key == termbox.KeyEsc {
+			switch ev.Key {
+			case termbox.KeyEsc:
 				break mainloop
+			case termbox.KeyTab:
+				// TODO: if shift pressed, move left
+				moveViewRight()
+			case termbox.KeyArrowLeft, termbox.KeyCtrlB:
+				editbox.MoveCursorOneRuneBackward()
+			case termbox.KeyArrowRight, termbox.KeyCtrlF:
+				editbox.MoveCursorOneRuneForward()
+			case termbox.KeyBackspace, termbox.KeyBackspace2:
+				editbox.DeleteRuneBackward()
+			case termbox.KeyDelete, termbox.KeyCtrlD:
+				editbox.DeleteRuneForward()
+			case termbox.KeySpace:
+				editbox.InsertRune(' ')
+			case termbox.KeyCtrlK:
+				editbox.DeleteTheRestOfTheLine()
+			case termbox.KeyHome, termbox.KeyCtrlA:
+				editbox.MoveCursorToBeginningOfTheLine()
+			case termbox.KeyEnd, termbox.KeyCtrlE:
+				editbox.MoveCursorToEndOfTheLine()
+			default:
+				if ev.Ch != 0 {
+					editbox.InsertRune(ev.Ch)
+				}
 			}
 			render()
-
 		case <-devices[deviceIndex].ping:
 			render()
 		}
