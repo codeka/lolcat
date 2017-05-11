@@ -64,9 +64,10 @@ type LogBuffer struct {
 type LogView struct {
 	Name string
 
-	lb     *LogBuffer
-	filter *regexp.Regexp
-	index  []int64
+	lb         *LogBuffer
+	filter     *regexp.Regexp
+	filterText string
+	index      []int64
 }
 
 // Device is all the stuff we know about a single attached device.
@@ -94,6 +95,9 @@ func (d *Device) appendLine(line string) {
 	d.logBuffer.nextLineIndex++
 	if d.logBuffer.nextLineIndex >= len(d.logBuffer.lines) {
 		d.logBuffer.nextLineIndex = 0
+	}
+	for _, lv := range d.logViews {
+		lv.AppendLine(line, d.logBuffer.lineNo)
 	}
 	d.mutex.Unlock()
 
@@ -192,6 +196,13 @@ func (lb *LogBuffer) GetLines(from, to int64) []string {
 	return res
 }
 
+// AppendLine will append the given line number to our index if it matches the current filter.
+func (lv *LogView) AppendLine(line string, lineNo int64) {
+	if lv.filter.MatchString(line) {
+		lv.index = append(lv.index, lineNo)
+	}
+}
+
 // UpdateFilter refreshes the filter for the current LogView to be the given regex.
 func (lv *LogView) UpdateFilter(lb *LogBuffer, str string) {
 	runes := []rune(str)
@@ -204,6 +215,7 @@ func (lv *LogView) UpdateFilter(lb *LogBuffer, str string) {
 		lv.Name = str
 	}
 
+	lv.filterText = str
 	filter, err := regexp.Compile(str)
 	if err != nil {
 		lv.filter = nil
@@ -409,6 +421,14 @@ func (eb *EditBox) DeleteTheRestOfTheLine() {
 	eb.text = eb.text[:eb.cursorOffsetBytes]
 }
 
+// SetText sets the current text to the given value
+func (eb *EditBox) SetText(text string) {
+	eb.text = []byte(text)
+	if eb.cursorOffsetBytes > len(eb.text) {
+		eb.MoveCursorTo(len(eb.text))
+	}
+}
+
 // InsertRune inserts the given rune at the current cursor position.
 func (eb *EditBox) InsertRune(r rune) {
 	var buf [utf8.UTFMax]byte
@@ -547,17 +567,35 @@ func render() {
 
 // moveViewRight moves the selected view one to the right. If there's no more views, we'll create
 // a new one with an empty filter.
-func moveViewRight() {
+func createNewView() {
 	device := devices[deviceIndex]
-	viewIndex++
-	if (viewIndex - 1) == len(device.logViews) {
-		device.logViews = append(device.logViews, &LogView{
-			Name: "<empty>",
-			lb:   device.logBuffer,
-		})
-	}
+	device.mutex.Lock()
+	device.logViews = append(device.logViews, &LogView{
+		Name: "<empty>",
+		lb:   device.logBuffer,
+	})
+	viewIndex = len(device.logViews)
+	device.logViews[viewIndex-1].UpdateFilter(device.logBuffer, "")
+	device.mutex.Unlock()
 	editbox.MoveCursorToBeginningOfTheLine()
 	editbox.DeleteTheRestOfTheLine()
+	render()
+}
+
+func moveViewTo(index int) {
+	device := devices[deviceIndex]
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(device.logViews) {
+		index = len(device.logViews)
+	}
+	viewIndex = index
+	if index == 0 {
+		editbox.SetText("")
+	} else {
+		editbox.SetText(device.logViews[viewIndex-1].filterText)
+	}
 	render()
 }
 
@@ -619,7 +657,7 @@ func main() {
 		panic(err)
 	}
 	defer termbox.Close()
-	termbox.SetInputMode(termbox.InputEsc)
+	termbox.SetInputMode(termbox.InputAlt)
 
 	refreshDevices()
 	render()
@@ -636,11 +674,11 @@ mainloop:
 		select {
 		case ev := <-events:
 			switch ev.Key {
-			case termbox.KeyEsc:
+			case termbox.KeyCtrlC:
 				break mainloop
 			case termbox.KeyTab:
-				// TODO: if shift pressed, move left
-				moveViewRight()
+				// TODO: tab is a shortcut for new filter, always
+				createNewView()
 			case termbox.KeyArrowLeft, termbox.KeyCtrlB:
 				editbox.MoveCursorOneRuneBackward()
 			case termbox.KeyArrowRight, termbox.KeyCtrlF:
@@ -658,6 +696,12 @@ mainloop:
 			case termbox.KeyEnd, termbox.KeyCtrlE:
 				editbox.MoveCursorToEndOfTheLine()
 			default:
+				if ev.Ch >= '1' && ev.Ch <= '9' {
+					if ev.Mod == termbox.ModAlt {
+						moveViewTo(int(ev.Ch - '1'))
+						ev.Ch = 0
+					}
+				}
 				if ev.Ch != 0 {
 					editbox.InsertRune(ev.Ch)
 				}
